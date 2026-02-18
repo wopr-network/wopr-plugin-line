@@ -499,6 +499,23 @@ describe("sendReply()", () => {
     });
     expect(client.replyMessage).not.toHaveBeenCalled();
   });
+
+  it("expired reply token (HTTPFetchError 400): falls back to pushMessage", async () => {
+    const sdk = jest.requireMock("@line/bot-sdk");
+    const client = new sdk.messagingApi.MessagingApiClient({});
+    const expiredTokenError = new sdk.HTTPFetchError(400, "Invalid reply token");
+    (client.replyMessage as jest.Mock).mockRejectedValueOnce(expiredTokenError);
+
+    await sendReplyFn("Hello!", "expired-token", "Uuser123");
+
+    expect(client.replyMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ replyToken: "expired-token" })
+    );
+    expect(client.pushMessage).toHaveBeenCalledWith({
+      to: "Uuser123",
+      messages: [{ type: "text", text: "Hello!" }],
+    });
+  });
 });
 
 // ─── Test 19: Signature validation error handler ──────────────────────────────

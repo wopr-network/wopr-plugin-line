@@ -208,6 +208,8 @@ function isAllowed(userId: string, isGroup: boolean): boolean {
 
 // Handle a LINE webhook event
 async function handleEvent(event: webhook.Event): Promise<void> {
+  if (isShuttingDown) return;
+
   // Only handle message events
   if (event.type !== "message") {
     logger.debug(`Ignoring event type: ${event.type}`);
@@ -482,6 +484,7 @@ const plugin: WOPRPlugin = {
   description: "LINE Bot integration using LINE Bot SDK",
 
   async init(context: WOPRPluginContext): Promise<void> {
+    isShuttingDown = false;
     ctx = context;
     config = (context.getConfig() || {}) as LINEConfig;
 
