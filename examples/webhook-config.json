@@ -1,0 +1,52 @@
+{
+  "_comment": "WOPR LINE Plugin Configuration - Webhook Mode",
+  "description": "LINE is webhook-only; this is the standard configuration",
+
+  "channels": {
+    "line": {
+      "_comment": "Authentication (both required)",
+      "channelAccessToken": "${LINE_CHANNEL_ACCESS_TOKEN}",
+      "channelSecret": "${LINE_CHANNEL_SECRET}",
+
+      "_comment_webhook": "Webhook Server Settings",
+      "webhookPort": 3000,
+      "webhookPath": "/webhook",
+      "_webhookNote": "Set this URL in LINE Developers Console: https://yourdomain.com:3000/webhook",
+
+      "_comment_dm": "Direct Message Settings",
+      "dmPolicy": "open",
+      "_dmPolicyOptions": [
+        "allowlist - Only users in allowFrom can DM",
+        "open - Anyone can DM",
+        "disabled - DMs ignored"
+      ],
+
+      "allowFrom": [],
+      "_allowFrom_note": "LINE user IDs (U followed by 32 hex chars)",
+
+      "_comment_group": "Group Settings",
+      "groupPolicy": "open",
+      "_groupPolicyOptions": [
+        "allowlist - Only users in groupAllowFrom can trigger",
+        "open - Anyone in groups can trigger",
+        "disabled - Group messages ignored"
+      ],
+
+      "groupAllowFrom": [],
+
+      "_comment_performance": "Performance Settings",
+      "timeoutSeconds": 30
+    }
+  },
+
+  "_setup_steps": {
+    "step1": "Go to https://developers.line.biz/ and create a Messaging API channel",
+    "step2": "Issue a long-lived channel access token",
+    "step3": "Copy the channel secret from Basic settings",
+    "step4": "Set LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET env vars",
+    "step5": "Expose this server publicly (ngrok for dev, reverse proxy for prod)",
+    "step6": "Set webhook URL in LINE Developers Console to https://yourdomain.com/webhook",
+    "step7": "Enable 'Use webhook' in the console",
+    "step8": "Start WOPR daemon: wopr daemon start"
+  }
+}
