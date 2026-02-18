@@ -1,29 +1,27 @@
 /**
- * WOPR LINE Plugin - LINE Bot SDK-based LINE Messaging API integration
+ * WOPR LINE Plugin
+ *
+ * LINE Messaging API integration via @line/bot-sdk.
+ * Webhook-only (LINE does not support long-polling).
+ * Registers a ChannelProvider so other WOPR systems can send LINE messages.
  */
 
 import http from "node:http";
-import path from "node:path";
 import express from "express";
-import winston from "winston";
 import {
-  middleware,
-  messagingApi,
-  webhook,
   HTTPFetchError,
-  SignatureValidationFailed,
   JSONParseError,
+  SignatureValidationFailed,
+  messagingApi,
+  middleware,
+  webhook,
 } from "@line/bot-sdk";
-import type {
-  WOPRPlugin,
-  WOPRPluginContext,
-  ConfigSchema,
-  AgentIdentity,
-  ChannelInfo,
-  LogMessageOptions,
-} from "./types.js";
+import type { ChannelProvider, ConfigSchema, WOPRPlugin, WOPRPluginContext } from "./types.js";
 
-// LINE config interface
+// ============================================================================
+// Config interface
+// ============================================================================
+
 interface LINEConfig {
   channelAccessToken?: string;
   channelSecret?: string;
@@ -33,50 +31,21 @@ interface LINEConfig {
   allowFrom?: string[];
   groupPolicy?: "allowlist" | "open" | "disabled";
   groupAllowFrom?: string[];
-  timeoutSeconds?: number;
 }
 
+// ============================================================================
 // Module-level state
+// ============================================================================
+
 let ctx: WOPRPluginContext | null = null;
 let config: LINEConfig = {};
-let agentIdentity: AgentIdentity = { name: "WOPR", emoji: "🤖" };
 let lineClient: messagingApi.MessagingApiClient | null = null;
 let server: http.Server | null = null;
-let isShuttingDown = false;
-let logger: winston.Logger;
 
-// Initialize winston logger
-function initLogger(): winston.Logger {
-  const WOPR_HOME = process.env.WOPR_HOME || path.join(process.env.HOME || "~", ".wopr");
-  return winston.createLogger({
-    level: "debug",
-    format: winston.format.combine(
-      winston.format.timestamp(),
-      winston.format.errors({ stack: true }),
-      winston.format.json()
-    ),
-    defaultMeta: { service: "wopr-plugin-line" },
-    transports: [
-      new winston.transports.File({
-        filename: path.join(WOPR_HOME, "logs", "line-plugin-error.log"),
-        level: "error",
-      }),
-      new winston.transports.File({
-        filename: path.join(WOPR_HOME, "logs", "line-plugin.log"),
-        level: "debug",
-      }),
-      new winston.transports.Console({
-        format: winston.format.combine(
-          winston.format.colorize(),
-          winston.format.simple()
-        ),
-        level: "warn",
-      }),
-    ],
-  });
-}
-
+// ============================================================================
 // Config schema
+// ============================================================================
+
 const configSchema: ConfigSchema = {
   title: "LINE Integration",
   description: "Configure LINE Bot integration using LINE Bot SDK",
@@ -143,74 +112,117 @@ const configSchema: ConfigSchema = {
       placeholder: "U1234567890abcdef...",
       description: "User IDs allowed to trigger in groups (for allowlist policy)",
     },
-    {
-      name: "timeoutSeconds",
-      type: "number",
-      label: "API Timeout (seconds)",
-      placeholder: "30",
-      default: 30,
-      description: "Timeout for LINE API calls",
-    },
   ],
 };
 
-// Refresh identity
-async function refreshIdentity(): Promise<void> {
-  if (!ctx) return;
-  try {
-    const identity = await ctx.getAgentIdentity();
-    if (identity) {
-      agentIdentity = { ...agentIdentity, ...identity };
-      logger.info("Identity refreshed:", agentIdentity.name);
-    }
-  } catch (e) {
-    logger.warn("Failed to refresh identity:", String(e));
-  }
-}
+// ============================================================================
+// Credential resolution
+// ============================================================================
 
-// Resolve credentials
 function resolveCredentials(): { channelAccessToken: string; channelSecret: string } {
-  const channelAccessToken =
-    config.channelAccessToken || process.env.LINE_CHANNEL_ACCESS_TOKEN;
-  const channelSecret =
-    config.channelSecret || process.env.LINE_CHANNEL_SECRET;
+  const channelAccessToken = config.channelAccessToken ?? process.env.LINE_CHANNEL_ACCESS_TOKEN;
+  const channelSecret = config.channelSecret ?? process.env.LINE_CHANNEL_SECRET;
 
   if (!channelAccessToken) {
     throw new Error(
-      "LINE channel access token required. Set channels.line.channelAccessToken or LINE_CHANNEL_ACCESS_TOKEN env var."
+      "LINE channel access token required. Set channels.line.channelAccessToken or LINE_CHANNEL_ACCESS_TOKEN env var.",
     );
   }
   if (!channelSecret) {
     throw new Error(
-      "LINE channel secret required. Set channels.line.channelSecret or LINE_CHANNEL_SECRET env var."
+      "LINE channel secret required. Set channels.line.channelSecret or LINE_CHANNEL_SECRET env var.",
     );
   }
 
   return { channelAccessToken, channelSecret };
 }
 
-// Check if sender is allowed
-function isAllowed(userId: string, isGroup: boolean): boolean {
+// ============================================================================
+// Access control
+// ============================================================================
+
+export function isAllowed(userId: string, isGroup: boolean): boolean {
   if (isGroup) {
-    const policy = config.groupPolicy || "open";
+    const policy = config.groupPolicy ?? "open";
     if (policy === "open") return true;
     if (policy === "disabled") return false;
-    const allowed = config.groupAllowFrom || config.allowFrom || [];
+    const allowed = config.groupAllowFrom ?? config.allowFrom ?? [];
     return allowed.includes("*") || allowed.includes(userId);
   } else {
-    const policy = config.dmPolicy || "open";
+    const policy = config.dmPolicy ?? "open";
     if (policy === "open") return true;
     if (policy === "disabled") return false;
-    const allowed = config.allowFrom || [];
+    const allowed = config.allowFrom ?? [];
     return allowed.includes("*") || allowed.includes(userId);
   }
 }
 
-// Handle a LINE webhook event
-async function handleEvent(event: webhook.Event): Promise<void> {
-  // Only handle message events
+// ============================================================================
+// Message sending
+// ============================================================================
+
+export async function sendReply(text: string, replyToken: string | undefined, userId: string): Promise<void> {
+  if (!lineClient) {
+    throw new Error("LINE client not initialized");
+  }
+
+  const maxLength = 5000;
+  const maxMessages = 5;
+
+  const chunks: string[] = [];
+  if (text.length <= maxLength) {
+    chunks.push(text);
+  } else {
+    let current = "";
+    const sentences = text.split(/(?<=[.!?])\s+/);
+    for (const sentence of sentences) {
+      if (current.length + sentence.length + 1 <= maxLength) {
+        current += (current ? " " : "") + sentence;
+      } else {
+        if (current) chunks.push(current);
+        current = sentence;
+      }
+    }
+    if (current) chunks.push(current);
+  }
+
+  const messages: messagingApi.TextMessage[] = chunks.slice(0, maxMessages).map((chunk) => ({
+    type: "text",
+    text: chunk,
+  }));
+
+  try {
+    if (replyToken) {
+      try {
+        await lineClient.replyMessage({ replyToken, messages });
+        return;
+      } catch (err) {
+        // Reply token expired — fall through to pushMessage
+        if (err instanceof HTTPFetchError && err.status === 400) {
+          ctx?.log.warn("Reply token expired, falling back to pushMessage");
+        } else {
+          throw err;
+        }
+      }
+    }
+    await lineClient.pushMessage({ to: userId, messages });
+  } catch (err) {
+    if (err instanceof HTTPFetchError) {
+      ctx?.log.error(`LINE API error: ${err.status} ${err.body}`);
+    } else {
+      ctx?.log.error("Failed to send LINE message", err instanceof Error ? err.message : String(err));
+    }
+    throw err;
+  }
+}
+
+// ============================================================================
+// Event handling
+// ============================================================================
+
+export async function handleEvent(event: webhook.Event): Promise<void> {
   if (event.type !== "message") {
-    logger.debug(`Ignoring event type: ${event.type}`);
+    ctx?.log.info(`Ignoring LINE event type: ${event.type}`);
     return;
   }
 
@@ -222,25 +234,23 @@ async function handleEvent(event: webhook.Event): Promise<void> {
     source.type === "user"
       ? (source as webhook.UserSource).userId
       : source.type === "group"
-      ? (source as webhook.GroupSource).userId
-      : source.type === "room"
-      ? (source as webhook.RoomSource).userId
-      : undefined;
+        ? (source as webhook.GroupSource).userId
+        : source.type === "room"
+          ? (source as webhook.RoomSource).userId
+          : undefined;
 
   if (!userId) {
-    logger.debug("No userId in event source, skipping");
+    ctx?.log.info("No userId in LINE event source, skipping");
     return;
   }
 
   const isGroup = source.type === "group" || source.type === "room";
 
-  // Check permissions
   if (!isAllowed(userId, isGroup)) {
-    logger.info(`Message from ${userId} blocked by policy`);
+    ctx?.log.info(`LINE message from ${userId} blocked by policy`);
     return;
   }
 
-  // Extract text content based on message type
   const message = messageEvent.message;
   let text = "";
 
@@ -259,7 +269,7 @@ async function handleEvent(event: webhook.Event): Promise<void> {
       break;
     case "location": {
       const loc = message as webhook.LocationMessageContent;
-      text = `[location: ${loc.title || ""} ${loc.address || ""} (${loc.latitude}, ${loc.longitude})]`;
+      text = `[location: ${loc.title ?? ""} ${loc.address ?? ""} (${loc.latitude}, ${loc.longitude})]`;
       break;
     }
     case "sticker": {
@@ -279,225 +289,220 @@ async function handleEvent(event: webhook.Event): Promise<void> {
 
   if (!text) return;
 
-  // Build channel info
-  const channelId = isGroup
-    ? `group:${
-        source.type === "group"
-          ? (source as webhook.GroupSource).groupId
-          : (source as webhook.RoomSource).roomId
-      }`
-    : `dm:${userId}`;
+  const groupId =
+    source.type === "group"
+      ? (source as webhook.GroupSource).groupId
+      : source.type === "room"
+        ? (source as webhook.RoomSource).roomId
+        : undefined;
 
-  const channelInfo: ChannelInfo = {
-    type: "line",
-    id: channelId,
-    name: isGroup ? `LINE ${source.type}` : "LINE DM",
-  };
+  const channelId = isGroup ? `group:${groupId}` : `dm:${userId}`;
+  const sessionKey = `line-${isGroup ? groupId : userId}`;
+  const channelRef = { type: "line", id: channelId, name: isGroup ? `LINE ${source.type}` : "LINE DM" };
 
-  const sessionKey = `line-${
-    isGroup
-      ? source.type === "group"
-        ? (source as webhook.GroupSource).groupId
-        : (source as webhook.RoomSource).roomId
-      : userId
-  }`;
-
-  // Log incoming message
   if (ctx) {
-    const logOptions: LogMessageOptions = {
+    ctx.logMessage(sessionKey, text, { from: userId, channel: channelRef });
+
+    const response = await ctx.inject(sessionKey, `[${userId}]: ${text}`, {
       from: userId,
-      channel: channelInfo,
-    };
-    ctx.logMessage(sessionKey, text, logOptions);
-  }
+      channel: channelRef,
+    });
 
-  // Inject to WOPR and reply
-  await injectAndReply(text, userId, sessionKey, channelInfo, messageEvent.replyToken);
+    await sendReply(response, messageEvent.replyToken, userId);
+  }
 }
 
-// Inject message to WOPR and send reply
-async function injectAndReply(
-  text: string,
-  userId: string,
-  sessionKey: string,
-  channelInfo: ChannelInfo,
-  replyToken?: string
-): Promise<void> {
-  if (!ctx || !lineClient) return;
+// ============================================================================
+// Channel Provider
+// ============================================================================
 
-  const prefix = `[${userId}]: `;
-  const messageWithPrefix = prefix + text;
+import type { ChannelCommand, ChannelMessageParser } from "./types.js";
 
-  const response = await ctx.inject(sessionKey, messageWithPrefix, {
-    from: userId,
-    channel: channelInfo,
-  });
+const registeredCommands: Map<string, ChannelCommand> = new Map();
+const registeredParsers: Map<string, ChannelMessageParser> = new Map();
 
-  // Send response back via LINE
-  await sendReply(response, replyToken, userId);
-}
+const lineChannelProvider: ChannelProvider = {
+  id: "line",
 
-// Send reply via LINE API
-async function sendReply(
-  text: string,
-  replyToken: string | undefined,
-  userId: string
-): Promise<void> {
-  if (!lineClient) {
-    throw new Error("LINE client not initialized");
-  }
+  registerCommand(cmd: ChannelCommand): void {
+    registeredCommands.set(cmd.name, cmd);
+  },
 
-  const maxLength = 5000; // LINE text message limit
-  const maxMessages = 5; // LINE max messages per reply
+  unregisterCommand(name: string): void {
+    registeredCommands.delete(name);
+  },
 
-  // Split long messages at sentence boundaries
-  const chunks: string[] = [];
-  if (text.length <= maxLength) {
-    chunks.push(text);
-  } else {
-    let current = "";
-    const sentences = text.split(/(?<=[.!?])\s+/);
-    for (const sentence of sentences) {
-      if (current.length + sentence.length + 1 <= maxLength) {
-        current += (current ? " " : "") + sentence;
-      } else {
-        if (current) chunks.push(current);
-        current = sentence;
-      }
-    }
-    if (current) chunks.push(current);
-  }
+  getCommands(): ChannelCommand[] {
+    return Array.from(registeredCommands.values());
+  },
 
-  // Limit to max messages
-  const messagesToSend = chunks.slice(0, maxMessages);
+  addMessageParser(parser: ChannelMessageParser): void {
+    registeredParsers.set(parser.id, parser);
+  },
 
-  const messages: messagingApi.TextMessage[] = messagesToSend.map((chunk) => ({
-    type: "text",
-    text: chunk,
-  }));
+  removeMessageParser(id: string): void {
+    registeredParsers.delete(id);
+  },
 
-  try {
-    if (replyToken) {
-      try {
-        await lineClient.replyMessage({
-          replyToken,
-          messages,
-        });
-        return;
-      } catch (err) {
-        // Reply token may have expired — fall through to pushMessage
-        if (err instanceof HTTPFetchError && err.status === 400) {
-          logger.warn("Reply token expired, falling back to pushMessage");
+  getMessageParsers(): ChannelMessageParser[] {
+    return Array.from(registeredParsers.values());
+  },
+
+  getBotUsername(): string {
+    return "line-bot";
+  },
+
+  async send(channelId: string, content: string): Promise<void> {
+    if (!lineClient) throw new Error("LINE client not initialized");
+
+    // channelId format: "dm:Uxxxxx" or "group:Cxxxxx"
+    const colonIdx = channelId.indexOf(":");
+    const targetId = colonIdx >= 0 ? channelId.slice(colonIdx + 1) : channelId;
+
+    const maxLength = 5000;
+    const maxMessages = 5;
+    const chunks: string[] = [];
+
+    if (content.length <= maxLength) {
+      chunks.push(content);
+    } else {
+      let current = "";
+      const sentences = content.split(/(?<=[.!?])\s+/);
+      for (const sentence of sentences) {
+        if (current.length + sentence.length + 1 <= maxLength) {
+          current += (current ? " " : "") + sentence;
         } else {
-          throw err;
+          if (current) chunks.push(current);
+          current = sentence;
         }
       }
+      if (current) chunks.push(current);
     }
-    // Fallback to push message (no reply token or expired token)
-    await lineClient.pushMessage({
-      to: userId,
-      messages,
-    });
-  } catch (err) {
-    if (err instanceof HTTPFetchError) {
-      logger.error(`LINE API error: ${err.status} ${err.body}`);
-    } else {
-      logger.error("Failed to send LINE message:", err);
-    }
-    throw err;
-  }
-}
 
-// Start webhook server
+    const messages: messagingApi.TextMessage[] = chunks.slice(0, maxMessages).map((chunk) => ({
+      type: "text",
+      text: chunk,
+    }));
+
+    await lineClient.pushMessage({ to: targetId, messages });
+    ctx?.log.info(`LINE channel provider sent to ${channelId}`);
+  },
+};
+
+// ============================================================================
+// Webhook server
+// ============================================================================
+
 async function startWebhookServer(): Promise<void> {
   const { channelAccessToken, channelSecret } = resolveCredentials();
 
-  // Create LINE client
   lineClient = new messagingApi.MessagingApiClient({ channelAccessToken });
 
-  // Create Express app
   const app = express();
+  const webhookPath = config.webhookPath ?? "/webhook";
 
-  const webhookPath = config.webhookPath || "/webhook";
-
-  // LINE middleware validates signature and parses body
-  // IMPORTANT: Do NOT add global body parser before LINE middleware — it needs raw body
-  app.post(
-    webhookPath,
-    middleware({ channelSecret }),
-    (req: express.Request, res: express.Response) => {
-      // Respond immediately to LINE platform (must respond within seconds)
-      res.status(200).json({ status: "ok" });
-
-      // Process events asynchronously
-      const events: webhook.Event[] = (req.body as { events: webhook.Event[] }).events || [];
-      for (const event of events) {
-        handleEvent(event).catch((err) => {
-          logger.error("Error handling LINE event:", err);
-        });
-      }
+  // IMPORTANT: Do NOT add global body parsers before LINE middleware —
+  // it needs the raw body to validate the webhook signature.
+  app.post(webhookPath, middleware({ channelSecret }), (req: express.Request, res: express.Response) => {
+    res.status(200).json({ status: "ok" });
+    const events: webhook.Event[] = (req.body as { events: webhook.Event[] }).events ?? [];
+    for (const event of events) {
+      handleEvent(event).catch((err) => {
+        ctx?.log.error("Error handling LINE event", err instanceof Error ? err.message : String(err));
+      });
     }
-  );
+  });
 
-  // Error handling middleware for signature validation failures
+  // Error handler for signature validation failures
   app.use(
     (
       err: Error,
       _req: express.Request,
       res: express.Response,
-      next: express.NextFunction
+      next: express.NextFunction,
     ) => {
       if (err instanceof SignatureValidationFailed) {
-        logger.warn("Signature validation failed:", (err as any).signature);
+        ctx?.log.warn("LINE signature validation failed");
         res.status(401).send("Invalid signature");
         return;
       }
       if (err instanceof JSONParseError) {
-        logger.warn("JSON parse error");
+        ctx?.log.warn("LINE JSON parse error");
         res.status(400).send("Invalid JSON");
         return;
       }
       next(err);
-    }
+    },
   );
 
-  // Health check endpoint
   app.get("/health", (_req, res) => {
-    res.json({ status: "ok", plugin: "wopr-plugin-line" });
+    res.json({ status: "ok", plugin: "@wopr-network/wopr-plugin-line" });
   });
 
-  // Start server
-  const port = config.webhookPort || 3000;
+  const port = config.webhookPort ?? 3000;
   server = app.listen(port, () => {
-    logger.info(
-      `LINE webhook server listening on port ${port} at path ${webhookPath}`
-    );
+    ctx?.log.info(`LINE webhook server listening on port ${port} at ${webhookPath}`);
   });
 }
 
+// ============================================================================
 // Plugin definition
+// ============================================================================
+
 const plugin: WOPRPlugin = {
-  name: "line",
+  name: "wopr-plugin-line",
   version: "1.0.0",
   description: "LINE Bot integration using LINE Bot SDK",
 
-  async init(context: WOPRPluginContext): Promise<void> {
+  manifest: {
+    name: "@wopr-network/wopr-plugin-line",
+    version: "1.0.0",
+    description: "LINE Bot integration using LINE Bot SDK",
+    capabilities: ["channel"],
+    requires: {
+      env: ["LINE_CHANNEL_ACCESS_TOKEN", "LINE_CHANNEL_SECRET"],
+      network: {
+        outbound: true,
+        inbound: true,
+        hosts: ["api.line.me"],
+      },
+    },
+    provides: {
+      capabilities: [
+        {
+          type: "channel",
+          id: "line",
+          displayName: "LINE",
+          tier: "byok",
+        },
+      ],
+    },
+    icon: "💬",
+    category: "communication",
+    tags: ["line", "messaging", "channel", "japan"],
+    lifecycle: {
+      shutdownBehavior: "drain",
+      shutdownTimeoutMs: 30_000,
+    },
+  },
+
+  async init(context: WOPRPluginContext) {
     ctx = context;
-    config = (context.getConfig() || {}) as LINEConfig;
+    config = (context.getConfig<LINEConfig>()) ?? {};
 
-    logger = initLogger();
+    ctx.registerConfigSchema("wopr-plugin-line", configSchema);
 
-    ctx.registerConfigSchema("line", configSchema);
+    // Register channel provider (always, even without credentials)
+    if (ctx.registerChannelProvider) {
+      ctx.registerChannelProvider(lineChannelProvider);
+      ctx.log.info("Registered LINE channel provider");
+    }
 
-    await refreshIdentity();
-
-    // Validate credentials
+    // Check credentials
     try {
       resolveCredentials();
-    } catch (err) {
-      logger.warn(
-        "No LINE credentials configured. Run 'wopr configure --plugin line' to set up."
-      );
+    } catch (_err) {
+      ctx.log.warn("No LINE credentials configured. Run 'wopr configure --plugin line' to set up.");
       return;
     }
 
@@ -505,15 +510,17 @@ const plugin: WOPRPlugin = {
     try {
       await startWebhookServer();
     } catch (err) {
-      logger.error("Failed to start LINE webhook server:", err);
+      ctx.log.error("Failed to start LINE webhook server", err instanceof Error ? err.message : String(err));
     }
   },
 
-  async shutdown(): Promise<void> {
-    isShuttingDown = true;
+  async shutdown() {
+    if (ctx?.unregisterChannelProvider) {
+      ctx.unregisterChannelProvider("line");
+    }
 
     if (server) {
-      logger.info("Stopping LINE webhook server...");
+      ctx?.log.info("Stopping LINE webhook server...");
       await new Promise<void>((resolve, reject) => {
         server!.close((err) => {
           if (err) reject(err);
@@ -529,6 +536,3 @@ const plugin: WOPRPlugin = {
 };
 
 export default plugin;
-
-// Export for testing
-export { isAllowed, handleEvent, sendReply, injectAndReply, resolveCredentials };
