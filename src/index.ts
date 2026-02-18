@@ -41,6 +41,7 @@ let ctx: WOPRPluginContext | null = null;
 let config: LINEConfig = {};
 let lineClient: messagingApi.MessagingApiClient | null = null;
 let server: http.Server | null = null;
+let isShuttingDown = false;
 
 // ============================================================================
 // Config schema
@@ -158,14 +159,10 @@ export function isAllowed(userId: string, isGroup: boolean): boolean {
 }
 
 // ============================================================================
-// Message sending
+// Message chunking
 // ============================================================================
 
-export async function sendReply(text: string, replyToken: string | undefined, userId: string): Promise<void> {
-  if (!lineClient) {
-    throw new Error("LINE client not initialized");
-  }
-
+export function chunkMessage(text: string): string[] {
   const maxLength = 5000;
   const maxMessages = 5;
 
@@ -186,7 +183,19 @@ export async function sendReply(text: string, replyToken: string | undefined, us
     if (current) chunks.push(current);
   }
 
-  const messages: messagingApi.TextMessage[] = chunks.slice(0, maxMessages).map((chunk) => ({
+  return chunks.slice(0, maxMessages);
+}
+
+// ============================================================================
+// Message sending
+// ============================================================================
+
+export async function sendReply(text: string, replyToken: string | undefined, userId: string): Promise<void> {
+  if (!lineClient) {
+    throw new Error("LINE client not initialized");
+  }
+
+  const messages: messagingApi.TextMessage[] = chunkMessage(text).map((chunk) => ({
     type: "text",
     text: chunk,
   }));
@@ -221,6 +230,7 @@ export async function sendReply(text: string, replyToken: string | undefined, us
 // ============================================================================
 
 export async function handleEvent(event: webhook.Event): Promise<void> {
+  if (isShuttingDown) return;
   if (event.type !== "message") {
     ctx?.log.info(`Ignoring LINE event type: ${event.type}`);
     return;
@@ -359,27 +369,7 @@ const lineChannelProvider: ChannelProvider = {
     const colonIdx = channelId.indexOf(":");
     const targetId = colonIdx >= 0 ? channelId.slice(colonIdx + 1) : channelId;
 
-    const maxLength = 5000;
-    const maxMessages = 5;
-    const chunks: string[] = [];
-
-    if (content.length <= maxLength) {
-      chunks.push(content);
-    } else {
-      let current = "";
-      const sentences = content.split(/(?<=[.!?])\s+/);
-      for (const sentence of sentences) {
-        if (current.length + sentence.length + 1 <= maxLength) {
-          current += (current ? " " : "") + sentence;
-        } else {
-          if (current) chunks.push(current);
-          current = sentence;
-        }
-      }
-      if (current) chunks.push(current);
-    }
-
-    const messages: messagingApi.TextMessage[] = chunks.slice(0, maxMessages).map((chunk) => ({
+    const messages: messagingApi.TextMessage[] = chunkMessage(content).map((chunk) => ({
       type: "text",
       text: chunk,
     }));
@@ -487,6 +477,7 @@ const plugin: WOPRPlugin = {
   },
 
   async init(context: WOPRPluginContext) {
+    isShuttingDown = false;
     ctx = context;
     config = (context.getConfig<LINEConfig>()) ?? {};
 
@@ -515,6 +506,8 @@ const plugin: WOPRPlugin = {
   },
 
   async shutdown() {
+    isShuttingDown = true;
+
     if (ctx?.unregisterChannelProvider) {
       ctx.unregisterChannelProvider("line");
     }

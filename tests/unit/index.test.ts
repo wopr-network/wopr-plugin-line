@@ -360,6 +360,14 @@ describe("sendReply()", () => {
     expect(mockPushMessage).toHaveBeenCalledWith({ to: "Uuser123", messages: [{ type: "text", text: "Hello!" }] });
     expect(mockReplyMessage).not.toHaveBeenCalled();
   });
+
+  it("HTTPFetchError(400) on replyMessage: falls back to pushMessage", async () => {
+    const { HTTPFetchError } = await import("@line/bot-sdk");
+    mockReplyMessage.mockRejectedValueOnce(new HTTPFetchError(400, "Reply token expired"));
+    await sendReply("Hello!", "expired-reply-token", "Uuser123");
+    expect(mockReplyMessage).toHaveBeenCalledWith({ replyToken: "expired-reply-token", messages: [{ type: "text", text: "Hello!" }] });
+    expect(mockPushMessage).toHaveBeenCalledWith({ to: "Uuser123", messages: [{ type: "text", text: "Hello!" }] });
+  });
 });
 
 // ── §19: Signature validation error handler ───────────────────────────────────
