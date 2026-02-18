@@ -1,0 +1,46 @@
+{
+  "name": "@wopr-network/wopr-plugin-line",
+  "version": "1.0.0",
+  "description": "LINE channel plugin for WOPR using LINE Bot SDK",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "prepublishOnly": "npm run build",
+    "lint": "biome check --config-path=. src/",
+    "lint:fix": "biome check --config-path=. --fix src/",
+    "format": "biome format --config-path=. --write src/",
+    "check": "biome check --config-path=. src/ && tsc --noEmit",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "wopr",
+    "plugin",
+    "line",
+    "line-bot",
+    "messaging"
+  ],
+  "author": "WOPR",
+  "license": "MIT",
+  "dependencies": {
+    "@line/bot-sdk": "^9.0.0",
+    "@wopr-network/plugin-types": "^0.2.0",
+    "express": "^4.18.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.3.15",
+    "@types/express": "^4.17.0",
+    "@types/node": "^25.0.0",
+    "typescript": "^5.3.0",
+    "vitest": "^4.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist"
+  ]
+}
