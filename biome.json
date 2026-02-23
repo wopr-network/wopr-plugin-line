@@ -23,6 +23,12 @@
         "noUnusedImports": "error"
       },
       "suspicious": {
+        "noConsole": {
+          "level": "error",
+          "options": {
+            "allow": ["warn", "error", "info"]
+          }
+        },
         "noExplicitAny": "warn"
       },
       "style": {
