@@ -89,6 +89,7 @@ function buildMockContext(cfg: Record<string, unknown> = {}): WOPRPluginContext 
     saveConfig: vi.fn().mockResolvedValue(undefined),
     getMainConfig: vi.fn().mockReturnValue({}),
     registerConfigSchema: vi.fn(),
+    unregisterConfigSchema: vi.fn(),
     registerChannelProvider: vi.fn(),
     unregisterChannelProvider: vi.fn(),
     registerExtension: vi.fn(),
@@ -118,7 +119,14 @@ function buildMessageEvent(
 }
 
 beforeEach(() => {
-  vi.clearAllMocks();
+  // Clear call history without wiping implementations
+  mockReplyMessage.mockClear();
+  mockPushMessage.mockClear();
+  mockAppPost.mockClear();
+  mockAppGet.mockClear();
+  mockAppUse.mockClear();
+  mockServerClose.mockClear();
+  mockListen.mockClear();
   delete process.env.LINE_CHANNEL_ACCESS_TOKEN;
   delete process.env.LINE_CHANNEL_SECRET;
 });
@@ -145,6 +153,27 @@ describe("Plugin exports", () => {
   it("has manifest with channel capability", () => {
     expect(plugin.manifest).toBeDefined();
     expect(plugin.manifest?.capabilities).toContain("channel");
+  });
+
+  it("has configSchema in manifest", () => {
+    expect(plugin.manifest?.configSchema).toBeDefined();
+    expect(plugin.manifest?.configSchema?.fields.length).toBeGreaterThan(0);
+  });
+
+  it("marks credential fields as secret", () => {
+    const fields = plugin.manifest?.configSchema?.fields ?? [];
+    const tokenField = fields.find((f: { name: string }) => f.name === "channelAccessToken");
+    const secretField = fields.find((f: { name: string }) => f.name === "channelSecret");
+    expect(tokenField?.secret).toBe(true);
+    expect(secretField?.secret).toBe(true);
+  });
+
+  it("sets setupFlow on credential fields", () => {
+    const fields = plugin.manifest?.configSchema?.fields ?? [];
+    const tokenField = fields.find((f: { name: string }) => f.name === "channelAccessToken");
+    const secretField = fields.find((f: { name: string }) => f.name === "channelSecret");
+    expect(tokenField?.setupFlow).toBe("paste");
+    expect(secretField?.setupFlow).toBe("paste");
   });
 });
 
@@ -202,6 +231,20 @@ describe("shutdown()", () => {
   });
 
   it("does not throw when called without prior init", async () => {
+    await plugin.shutdown!();
+  });
+
+  it("unregisters config schema", async () => {
+    const ctx = buildMockContext({ channelAccessToken: "token", channelSecret: "secret" });
+    await plugin.init!(ctx);
+    await plugin.shutdown!();
+    expect((ctx as unknown as { unregisterConfigSchema: ReturnType<typeof vi.fn> }).unregisterConfigSchema).toHaveBeenCalledWith("wopr-plugin-line");
+  });
+
+  it("is idempotent — second shutdown does not throw", async () => {
+    const ctx = buildMockContext({ channelAccessToken: "token", channelSecret: "secret" });
+    await plugin.init!(ctx);
+    await plugin.shutdown!();
     await plugin.shutdown!();
   });
 });
@@ -268,7 +311,13 @@ describe("handleEvent()", () => {
   let mockCtx: WOPRPluginContext;
 
   beforeEach(async () => {
-    vi.clearAllMocks();
+    mockReplyMessage.mockClear();
+    mockPushMessage.mockClear();
+    mockAppPost.mockClear();
+    mockAppGet.mockClear();
+    mockAppUse.mockClear();
+    mockServerClose.mockClear();
+    mockListen.mockClear();
     mockCtx = buildMockContext({
       channelAccessToken: "token",
       channelSecret: "secret",
@@ -334,7 +383,13 @@ describe("handleEvent()", () => {
 
 describe("sendReply()", () => {
   beforeEach(async () => {
-    vi.clearAllMocks();
+    mockReplyMessage.mockClear();
+    mockPushMessage.mockClear();
+    mockAppPost.mockClear();
+    mockAppGet.mockClear();
+    mockAppUse.mockClear();
+    mockServerClose.mockClear();
+    mockListen.mockClear();
     const ctx = buildMockContext({ channelAccessToken: "token", channelSecret: "secret" });
     await plugin.init!(ctx);
   });
