@@ -6,16 +6,16 @@
  * Registers a ChannelProvider so other WOPR systems can send LINE messages.
  */
 
-import http from "node:http";
-import express from "express";
+import type http from "node:http";
 import {
   HTTPFetchError,
   JSONParseError,
-  SignatureValidationFailed,
   messagingApi,
   middleware,
-  webhook,
+  SignatureValidationFailed,
+  type webhook,
 } from "@line/bot-sdk";
+import express from "express";
 import type { ChannelProvider, ConfigSchema, WOPRPlugin, WOPRPluginContext } from "./types.js";
 
 // ============================================================================
@@ -42,6 +42,7 @@ let config: LINEConfig = {};
 let lineClient: messagingApi.MessagingApiClient | null = null;
 let server: http.Server | null = null;
 let isShuttingDown = false;
+const cleanups: Array<() => void> = [];
 
 // ============================================================================
 // Config schema
@@ -58,6 +59,8 @@ const configSchema: ConfigSchema = {
       placeholder: "Long-lived channel access token",
       required: true,
       description: "Get from LINE Developers Console > Messaging API",
+      secret: true,
+      setupFlow: "paste",
     },
     {
       name: "channelSecret",
@@ -66,6 +69,8 @@ const configSchema: ConfigSchema = {
       placeholder: "Channel secret for signature validation",
       required: true,
       description: "Get from LINE Developers Console > Basic settings",
+      secret: true,
+      setupFlow: "paste",
     },
     {
       name: "webhookPort",
@@ -130,9 +135,7 @@ function resolveCredentials(): { channelAccessToken: string; channelSecret: stri
     );
   }
   if (!channelSecret) {
-    throw new Error(
-      "LINE channel secret required. Set channels.line.channelSecret or LINE_CHANNEL_SECRET env var.",
-    );
+    throw new Error("LINE channel secret required. Set channels.line.channelSecret or LINE_CHANNEL_SECRET env var.");
   }
 
   return { channelAccessToken, channelSecret };
@@ -205,7 +208,7 @@ export async function sendReply(text: string, replyToken: string | undefined, us
       try {
         await lineClient.replyMessage({ replyToken, messages });
         return;
-      } catch (err) {
+      } catch (err: unknown) {
         // Reply token expired — fall through to pushMessage
         if (err instanceof HTTPFetchError && err.status === 400) {
           ctx?.log.warn("Reply token expired, falling back to pushMessage");
@@ -215,7 +218,7 @@ export async function sendReply(text: string, replyToken: string | undefined, us
       }
     }
     await lineClient.pushMessage({ to: userId, messages });
-  } catch (err) {
+  } catch (err: unknown) {
     if (err instanceof HTTPFetchError) {
       ctx?.log.error(`LINE API error: ${err.status} ${err.body}`);
     } else {
@@ -397,33 +400,26 @@ async function startWebhookServer(): Promise<void> {
     res.status(200).json({ status: "ok" });
     const events: webhook.Event[] = (req.body as { events: webhook.Event[] }).events ?? [];
     for (const event of events) {
-      handleEvent(event).catch((err) => {
+      handleEvent(event).catch((err: unknown) => {
         ctx?.log.error("Error handling LINE event", err instanceof Error ? err.message : String(err));
       });
     }
   });
 
   // Error handler for signature validation failures
-  app.use(
-    (
-      err: Error,
-      _req: express.Request,
-      res: express.Response,
-      next: express.NextFunction,
-    ) => {
-      if (err instanceof SignatureValidationFailed) {
-        ctx?.log.warn("LINE signature validation failed");
-        res.status(401).send("Invalid signature");
-        return;
-      }
-      if (err instanceof JSONParseError) {
-        ctx?.log.warn("LINE JSON parse error");
-        res.status(400).send("Invalid JSON");
-        return;
-      }
-      next(err);
-    },
-  );
+  app.use((err: Error, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (err instanceof SignatureValidationFailed) {
+      ctx?.log.warn("LINE signature validation failed");
+      res.status(401).send("Invalid signature");
+      return;
+    }
+    if (err instanceof JSONParseError) {
+      ctx?.log.warn("LINE JSON parse error");
+      res.status(400).send("Invalid JSON");
+      return;
+    }
+    next(err);
+  });
 
   app.get("/health", (_req, res) => {
     res.json({ status: "ok", plugin: "@wopr-network/wopr-plugin-line" });
@@ -474,12 +470,13 @@ const plugin: WOPRPlugin = {
       shutdownBehavior: "drain",
       shutdownTimeoutMs: 30_000,
     },
+    configSchema,
   },
 
   async init(context: WOPRPluginContext) {
     isShuttingDown = false;
     ctx = context;
-    config = (context.getConfig<LINEConfig>()) ?? {};
+    config = context.getConfig<LINEConfig>() ?? {};
 
     ctx.registerConfigSchema("wopr-plugin-line", configSchema);
 
@@ -492,7 +489,7 @@ const plugin: WOPRPlugin = {
     // Check credentials
     try {
       resolveCredentials();
-    } catch (_err) {
+    } catch (_err: unknown) {
       ctx.log.warn("No LINE credentials configured. Run 'wopr configure --plugin line' to set up.");
       return;
     }
@@ -500,7 +497,7 @@ const plugin: WOPRPlugin = {
     // Start webhook server
     try {
       await startWebhookServer();
-    } catch (err) {
+    } catch (err: unknown) {
       ctx.log.error("Failed to start LINE webhook server", err instanceof Error ? err.message : String(err));
     }
   },
@@ -508,14 +505,26 @@ const plugin: WOPRPlugin = {
   async shutdown() {
     isShuttingDown = true;
 
+    if (ctx?.unregisterConfigSchema) {
+      ctx.unregisterConfigSchema("wopr-plugin-line");
+    }
+
     if (ctx?.unregisterChannelProvider) {
       ctx.unregisterChannelProvider("line");
     }
 
+    for (const cleanup of cleanups) {
+      cleanup();
+    }
+    cleanups.length = 0;
+
+    registeredCommands.clear();
+    registeredParsers.clear();
+
     if (server) {
       ctx?.log.info("Stopping LINE webhook server...");
       await new Promise<void>((resolve, reject) => {
-        server!.close((err) => {
+        server?.close((err) => {
           if (err) reject(err);
           else resolve();
         });
@@ -524,6 +533,7 @@ const plugin: WOPRPlugin = {
     }
 
     lineClient = null;
+    config = {};
     ctx = null;
   },
 };
