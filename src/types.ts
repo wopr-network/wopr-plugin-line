@@ -10,6 +10,8 @@ export type {
   AgentIdentity,
   ChannelCommand,
   ChannelMessageParser,
+  ChannelNotificationCallbacks,
+  ChannelNotificationPayload,
   ChannelProvider,
   ChannelRef,
   ConfigField,

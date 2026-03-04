@@ -16,7 +16,14 @@ import {
   type webhook,
 } from "@line/bot-sdk";
 import express from "express";
-import type { ChannelProvider, ConfigSchema, WOPRPlugin, WOPRPluginContext } from "./types.js";
+import type {
+  ChannelNotificationCallbacks,
+  ChannelNotificationPayload,
+  ChannelProvider,
+  ConfigSchema,
+  WOPRPlugin,
+  WOPRPluginContext,
+} from "./types.js";
 
 // ============================================================================
 // Config interface
@@ -43,6 +50,13 @@ let lineClient: messagingApi.MessagingApiClient | null = null;
 let server: http.Server | null = null;
 let isShuttingDown = false;
 const cleanups: Array<() => void> = [];
+interface PendingNotificationEntry {
+  callbacks: ChannelNotificationCallbacks;
+  createdAt: number;
+  expectedUserId: string;
+}
+const pendingNotifications: Map<string, PendingNotificationEntry> = new Map();
+let cleanupInterval: ReturnType<typeof setInterval> | null = null;
 
 // ============================================================================
 // Config schema
@@ -190,6 +204,65 @@ export function chunkMessage(text: string): string[] {
 }
 
 // ============================================================================
+// Notification helpers
+// ============================================================================
+
+export function getPendingNotification(notifId: string): ChannelNotificationCallbacks | undefined {
+  return pendingNotifications.get(notifId)?.callbacks;
+}
+
+export function clearPendingNotifications(): void {
+  pendingNotifications.clear();
+}
+
+export function buildFriendRequestFlexMessage(fromName: string, notifId: string): messagingApi.FlexMessage {
+  const displayName = fromName || "Someone";
+  return {
+    type: "flex",
+    altText: `Friend Request from ${displayName}`,
+    contents: {
+      type: "bubble",
+      body: {
+        type: "box",
+        layout: "vertical",
+        contents: [
+          { type: "text", text: "Friend Request", weight: "bold", size: "lg" },
+          { type: "text", text: `${displayName} sent you a friend request.`, wrap: true, margin: "md" },
+        ],
+      },
+      footer: {
+        type: "box",
+        layout: "horizontal",
+        spacing: "md",
+        contents: [
+          {
+            type: "button",
+            style: "primary",
+            color: "#1DB446",
+            action: {
+              type: "postback",
+              label: "Accept",
+              data: `notif_accept:${notifId}`,
+              displayText: "Accept",
+            },
+          },
+          {
+            type: "button",
+            style: "secondary",
+            action: {
+              type: "postback",
+              label: "Deny",
+              data: `notif_deny:${notifId}`,
+              displayText: "Deny",
+            },
+          },
+        ],
+      },
+    } as messagingApi.FlexBubble,
+  };
+}
+
+// ============================================================================
 // Message sending
 // ============================================================================
 
@@ -232,8 +305,90 @@ export async function sendReply(text: string, replyToken: string | undefined, us
 // Event handling
 // ============================================================================
 
+async function handlePostbackEvent(event: webhook.PostbackEvent): Promise<void> {
+  if (isShuttingDown) return;
+
+  const data = event.postback.data;
+  const isAccept = data.startsWith("notif_accept:");
+  const isDeny = data.startsWith("notif_deny:");
+
+  if (!isAccept && !isDeny) return;
+
+  const notifId = isAccept ? data.slice("notif_accept:".length) : data.slice("notif_deny:".length);
+
+  const entry = pendingNotifications.get(notifId);
+  pendingNotifications.delete(notifId);
+
+  const source = event.source;
+  const userId = source?.type === "user" ? (source as webhook.UserSource).userId : undefined; // Group/room sources don't reliably carry userId for reply context
+  const isGroup = source?.type === "group" || source?.type === "room";
+
+  if (userId && !isAllowed(userId, isGroup)) {
+    ctx?.log.info(`Postback from ${userId} blocked by policy`);
+    return;
+  }
+
+  if (!entry) {
+    ctx?.log.warn(`Notification ${notifId} not found (expired or already handled)`);
+    if (event.replyToken && userId) {
+      await sendReply("This notification has expired.", event.replyToken, userId);
+    }
+    return;
+  }
+
+  // Recipient validation: only the intended user may accept/deny
+  if (entry.expectedUserId && userId && userId !== entry.expectedUserId) {
+    ctx?.log.warn(`Notification ${notifId} postback from unexpected user ${userId} (expected ${entry.expectedUserId})`);
+    return;
+  }
+
+  const { callbacks } = entry;
+
+  if (isAccept) {
+    ctx?.log.info(`Notification ${notifId} accepted`);
+    if (callbacks.onAccept) {
+      try {
+        await callbacks.onAccept();
+        if (event.replyToken && userId) {
+          await sendReply("Friend request accepted.", event.replyToken, userId);
+        }
+      } catch (err: unknown) {
+        ctx?.log.error("onAccept callback failed", err instanceof Error ? err.message : String(err));
+        if (event.replyToken && userId) {
+          await sendReply("An error occurred processing your response.", event.replyToken, userId);
+        }
+      }
+    } else if (event.replyToken && userId) {
+      await sendReply("Friend request accepted.", event.replyToken, userId);
+    }
+  } else {
+    ctx?.log.info(`Notification ${notifId} denied`);
+    if (callbacks.onDeny) {
+      try {
+        await callbacks.onDeny();
+        if (event.replyToken && userId) {
+          await sendReply("Friend request denied.", event.replyToken, userId);
+        }
+      } catch (err: unknown) {
+        ctx?.log.error("onDeny callback failed", err instanceof Error ? err.message : String(err));
+        if (event.replyToken && userId) {
+          await sendReply("An error occurred processing your response.", event.replyToken, userId);
+        }
+      }
+    } else if (event.replyToken && userId) {
+      await sendReply("Friend request denied.", event.replyToken, userId);
+    }
+  }
+}
+
 export async function handleEvent(event: webhook.Event): Promise<void> {
   if (isShuttingDown) return;
+
+  if (event.type === "postback") {
+    await handlePostbackEvent(event as webhook.PostbackEvent);
+    return;
+  }
+
   if (event.type !== "message") {
     ctx?.log.info(`Ignoring LINE event type: ${event.type}`);
     return;
@@ -380,6 +535,31 @@ const lineChannelProvider: ChannelProvider = {
     await lineClient.pushMessage({ to: targetId, messages });
     ctx?.log.info(`LINE channel provider sent to ${channelId}`);
   },
+
+  async sendNotification(
+    channelId: string,
+    payload: ChannelNotificationPayload,
+    callbacks: ChannelNotificationCallbacks,
+  ): Promise<void> {
+    if (payload.type !== "friend-request") {
+      ctx?.log.warn(`Unsupported notification type: ${payload.type}`);
+      return;
+    }
+
+    if (!lineClient) throw new Error("LINE client not initialized");
+
+    const colonIdx = channelId.indexOf(":");
+    const targetId = colonIdx >= 0 ? channelId.slice(colonIdx + 1) : channelId;
+
+    const notifId = `notif_${crypto.randomUUID().slice(0, 8)}`;
+
+    const flexMessage = buildFriendRequestFlexMessage(payload.from ?? "", notifId);
+
+    await lineClient.pushMessage({ to: targetId, messages: [flexMessage] });
+
+    pendingNotifications.set(notifId, { callbacks, createdAt: Date.now(), expectedUserId: targetId });
+    ctx?.log.info(`Notification sent for friend request from ${payload.from ?? "unknown"} (notifId=${notifId})`);
+  },
 };
 
 // ============================================================================
@@ -459,7 +639,6 @@ const plugin: WOPRPlugin = {
           type: "channel",
           id: "line",
           displayName: "LINE",
-          tier: "byok",
         },
       ],
     },
@@ -479,6 +658,14 @@ const plugin: WOPRPlugin = {
     config = context.getConfig<LINEConfig>() ?? {};
 
     ctx.registerConfigSchema("wopr-plugin-line", configSchema);
+
+    // Start TTL cleanup for pending notifications (5-minute expiry)
+    cleanupInterval = setInterval(() => {
+      const now = Date.now();
+      for (const [id, entry] of pendingNotifications) {
+        if (now - entry.createdAt > 5 * 60 * 1000) pendingNotifications.delete(id);
+      }
+    }, 60_000);
 
     // Register channel provider (always, even without credentials)
     if (ctx.registerChannelProvider) {
@@ -505,6 +692,11 @@ const plugin: WOPRPlugin = {
   async shutdown() {
     isShuttingDown = true;
 
+    if (cleanupInterval) {
+      clearInterval(cleanupInterval);
+      cleanupInterval = null;
+    }
+
     if (ctx?.unregisterConfigSchema) {
       ctx.unregisterConfigSchema("wopr-plugin-line");
     }
@@ -520,6 +712,7 @@ const plugin: WOPRPlugin = {
 
     registeredCommands.clear();
     registeredParsers.clear();
+    pendingNotifications.clear();
 
     if (server) {
       ctx?.log.info("Stopping LINE webhook server...");
