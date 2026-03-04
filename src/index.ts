@@ -50,7 +50,13 @@ let lineClient: messagingApi.MessagingApiClient | null = null;
 let server: http.Server | null = null;
 let isShuttingDown = false;
 const cleanups: Array<() => void> = [];
-const pendingNotifications: Map<string, ChannelNotificationCallbacks> = new Map();
+interface PendingNotificationEntry {
+  callbacks: ChannelNotificationCallbacks;
+  createdAt: number;
+  expectedUserId: string;
+}
+const pendingNotifications: Map<string, PendingNotificationEntry> = new Map();
+let cleanupInterval: ReturnType<typeof setInterval> | null = null;
 
 // ============================================================================
 // Config schema
@@ -202,7 +208,7 @@ export function chunkMessage(text: string): string[] {
 // ============================================================================
 
 export function getPendingNotification(notifId: string): ChannelNotificationCallbacks | undefined {
-  return pendingNotifications.get(notifId);
+  return pendingNotifications.get(notifId)?.callbacks;
 }
 
 export function clearPendingNotifications(): void {
@@ -310,19 +316,27 @@ async function handlePostbackEvent(event: webhook.PostbackEvent): Promise<void> 
 
   const notifId = isAccept ? data.slice("notif_accept:".length) : data.slice("notif_deny:".length);
 
-  const callbacks = pendingNotifications.get(notifId);
+  const entry = pendingNotifications.get(notifId);
   pendingNotifications.delete(notifId);
 
   const source = event.source;
   const userId = source?.type === "user" ? (source as webhook.UserSource).userId : undefined; // Group/room sources don't reliably carry userId for reply context
 
-  if (!callbacks) {
+  if (!entry) {
     ctx?.log.warn(`Notification ${notifId} not found (expired or already handled)`);
     if (event.replyToken && userId) {
       await sendReply("This notification has expired.", event.replyToken, userId);
     }
     return;
   }
+
+  // Recipient validation: only the intended user may accept/deny
+  if (entry.expectedUserId && userId && userId !== entry.expectedUserId) {
+    ctx?.log.warn(`Notification ${notifId} postback from unexpected user ${userId} (expected ${entry.expectedUserId})`);
+    return;
+  }
+
+  const { callbacks } = entry;
 
   if (isAccept) {
     ctx?.log.info(`Notification ${notifId} accepted`);
@@ -527,7 +541,7 @@ const lineChannelProvider: ChannelProvider = {
 
     await lineClient.pushMessage({ to: targetId, messages: [flexMessage] });
 
-    pendingNotifications.set(notifId, callbacks);
+    pendingNotifications.set(notifId, { callbacks, createdAt: Date.now(), expectedUserId: targetId });
     ctx?.log.info(`Notification sent for friend request from ${payload.from ?? "unknown"} (notifId=${notifId})`);
   },
 };
@@ -630,6 +644,14 @@ const plugin: WOPRPlugin = {
 
     ctx.registerConfigSchema("wopr-plugin-line", configSchema);
 
+    // Start TTL cleanup for pending notifications (5-minute expiry)
+    cleanupInterval = setInterval(() => {
+      const now = Date.now();
+      for (const [id, entry] of pendingNotifications) {
+        if (now - entry.createdAt > 5 * 60 * 1000) pendingNotifications.delete(id);
+      }
+    }, 60_000);
+
     // Register channel provider (always, even without credentials)
     if (ctx.registerChannelProvider) {
       ctx.registerChannelProvider(lineChannelProvider);
@@ -654,6 +676,11 @@ const plugin: WOPRPlugin = {
 
   async shutdown() {
     isShuttingDown = true;
+
+    if (cleanupInterval) {
+      clearInterval(cleanupInterval);
+      cleanupInterval = null;
+    }
 
     if (ctx?.unregisterConfigSchema) {
       ctx.unregisterConfigSchema("wopr-plugin-line");
