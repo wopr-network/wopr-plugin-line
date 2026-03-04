@@ -51,7 +51,6 @@ let server: http.Server | null = null;
 let isShuttingDown = false;
 const cleanups: Array<() => void> = [];
 const pendingNotifications: Map<string, ChannelNotificationCallbacks> = new Map();
-let notificationCounter = 0;
 
 // ============================================================================
 // Config schema
@@ -208,7 +207,6 @@ export function getPendingNotification(notifId: string): ChannelNotificationCall
 
 export function clearPendingNotifications(): void {
   pendingNotifications.clear();
-  notificationCounter = 0;
 }
 
 export function buildFriendRequestFlexMessage(fromName: string, notifId: string): messagingApi.FlexMessage {
@@ -316,14 +314,7 @@ async function handlePostbackEvent(event: webhook.PostbackEvent): Promise<void> 
   pendingNotifications.delete(notifId);
 
   const source = event.source;
-  const userId =
-    source?.type === "user"
-      ? (source as webhook.UserSource).userId
-      : source?.type === "group"
-        ? (source as webhook.GroupSource).userId
-        : source?.type === "room"
-          ? (source as webhook.RoomSource).userId
-          : undefined;
+  const userId = source?.type === "user" ? (source as webhook.UserSource).userId : undefined; // Group/room sources don't reliably carry userId for reply context
 
   if (!callbacks) {
     ctx?.log.warn(`Notification ${notifId} not found (expired or already handled)`);
@@ -530,8 +521,7 @@ const lineChannelProvider: ChannelProvider = {
     const colonIdx = channelId.indexOf(":");
     const targetId = colonIdx >= 0 ? channelId.slice(colonIdx + 1) : channelId;
 
-    notificationCounter++;
-    const notifId = `notif_${notificationCounter}`;
+    const notifId = `notif_${crypto.randomUUID().slice(0, 8)}`;
 
     const flexMessage = buildFriendRequestFlexMessage(payload.from ?? "", notifId);
 
@@ -681,7 +671,6 @@ const plugin: WOPRPlugin = {
     registeredCommands.clear();
     registeredParsers.clear();
     pendingNotifications.clear();
-    notificationCounter = 0;
 
     if (server) {
       ctx?.log.info("Stopping LINE webhook server...");
