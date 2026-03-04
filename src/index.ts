@@ -321,6 +321,12 @@ async function handlePostbackEvent(event: webhook.PostbackEvent): Promise<void> 
 
   const source = event.source;
   const userId = source?.type === "user" ? (source as webhook.UserSource).userId : undefined; // Group/room sources don't reliably carry userId for reply context
+  const isGroup = source?.type === "group" || source?.type === "room";
+
+  if (userId && !isAllowed(userId, isGroup)) {
+    ctx?.log.info(`Postback from ${userId} blocked by policy`);
+    return;
+  }
 
   if (!entry) {
     ctx?.log.warn(`Notification ${notifId} not found (expired or already handled)`);
@@ -343,11 +349,16 @@ async function handlePostbackEvent(event: webhook.PostbackEvent): Promise<void> 
     if (callbacks.onAccept) {
       try {
         await callbacks.onAccept();
+        if (event.replyToken && userId) {
+          await sendReply("Friend request accepted.", event.replyToken, userId);
+        }
       } catch (err: unknown) {
         ctx?.log.error("onAccept callback failed", err instanceof Error ? err.message : String(err));
+        if (event.replyToken && userId) {
+          await sendReply("An error occurred processing your response.", event.replyToken, userId);
+        }
       }
-    }
-    if (event.replyToken && userId) {
+    } else if (event.replyToken && userId) {
       await sendReply("Friend request accepted.", event.replyToken, userId);
     }
   } else {
@@ -355,11 +366,16 @@ async function handlePostbackEvent(event: webhook.PostbackEvent): Promise<void> 
     if (callbacks.onDeny) {
       try {
         await callbacks.onDeny();
+        if (event.replyToken && userId) {
+          await sendReply("Friend request denied.", event.replyToken, userId);
+        }
       } catch (err: unknown) {
         ctx?.log.error("onDeny callback failed", err instanceof Error ? err.message : String(err));
+        if (event.replyToken && userId) {
+          await sendReply("An error occurred processing your response.", event.replyToken, userId);
+        }
       }
-    }
-    if (event.replyToken && userId) {
+    } else if (event.replyToken && userId) {
       await sendReply("Friend request denied.", event.replyToken, userId);
     }
   }
@@ -623,8 +639,7 @@ const plugin: WOPRPlugin = {
           type: "channel",
           id: "line",
           displayName: "LINE",
-          tier: "byok",
-        } as never,
+        },
       ],
     },
     icon: "💬",
