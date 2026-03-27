@@ -1,3 +1,11 @@
+# ⚠️ This package has moved
+
+This package is now maintained in the [wopr-plugins monorepo](https://github.com/wopr-network/wopr-plugins/tree/main/packages/plugin-line).
+
+This repository is archived and no longer accepts contributions.
+
+---
+
 # wopr-plugin-line
 
 LINE channel plugin for [WOPR](https://github.com/wopr-network/wopr) using the official LINE Bot SDK.
